@@ -142,6 +142,17 @@ class LMModel(StreamingContainer):
         main_kwargs = {
             k: v for k, v in kwargs.items() if not k.startswith(depformer_prefix)
         }
+
+        # Load the extra_heads for semantic VAD
+        # Note 1: To trigger this, you will need to pass an extra config param, e.g.
+        #         info.lm_config["extra_heads"] = {"num_heads": 4, "dim": 6}
+        # Note 2: These heads are only available in the -candle model, e.g. kyutai/stt-1b-en_fr-candle
+        if "extra_heads" in main_kwargs:
+            self.extra_heads = nn.ModuleList([ nn.Linear(dim, main_kwargs["extra_heads"]["dim"], bias=False) for _ in range(main_kwargs["extra_heads"]["num_heads"]) ])
+            del main_kwargs["extra_heads"]
+        else:
+            self.extra_heads = None        
+
         self.transformer = StreamingTransformer(
             d_model=dim,
             num_heads=num_heads,
@@ -763,6 +774,19 @@ class LMGen(StreamingModule[_LMGenState]):
         out = state.cache.gather(dim=2, index=index)
         mask = (state.offsets <= self.max_delay) | ~state.exec_mask
         out[mask, :, :] = lm_model.ungenerated_token_id
+        
+        # Apply the extra_heads for semantic VAD
+        # (return probabilities of pause length of 0.5s, 1.0s, 2.0s, 3.0s)
+        if lm_model.extra_heads:
+            prs = []
+            for extra_head_ in lm_model.extra_heads:
+                extra_head = extra_head_(transformer_out)
+                softmaxed = torch.nn.functional.softmax(extra_head, dim=-1)
+                selected = softmaxed[:, 0, 0]
+                prs_ = selected.tolist()
+                prs.append(prs_[0])
+            return (out, prs)        
+        
         return out
 
     def depformer_step(
